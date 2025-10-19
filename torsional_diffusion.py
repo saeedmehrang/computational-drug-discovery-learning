@@ -127,37 +127,40 @@ class MolecularTorsionAnalyzer:
         For a rotatable bond (i-j), find the 4 atoms (a-i-j-b) defining the dihedral angle.
 
         The dihedral angle is defined by 4 atoms in sequence:
-        - atom_a: neighbor of i (not j)
+        - atom_a: heavy-atom neighbor of i (not j, not hydrogen)
         - atom_i: first atom of rotatable bond
         - atom_j: second atom of rotatable bond
-        - atom_b: neighbor of j (not i)
+        - atom_b: heavy-atom neighbor of j (not i, not hydrogen)
+
+        This ensures we get the canonical heavy-atom torsion angle, which is what's
+        used in most molecular modeling applications and torsional diffusion models.
 
         Args:
             mol: RDKit molecule object
             bond_atoms: Tuple (atom_i_idx, atom_j_idx) of the rotatable bond
 
         Returns:
-            Tuple (a, i, j, b) of atom indices, or None if atoms cannot be found
+            Tuple (a, i, j, b) of atom indices, or None if heavy atoms cannot be found
 
         Example:
             For a bond C2-C3 in butane: H-C1-C2-C3-C4-H
-            Returns (C1, C2, C3, C4) indices
+            Returns (C1, C2, C3, C4) indices (not hydrogens)
         """
         atom_i_idx, atom_j_idx = bond_atoms
         atom_i = mol.GetAtomWithIdx(atom_i_idx)
         atom_j = mol.GetAtomWithIdx(atom_j_idx)
 
-        # Find a neighbor of atom_i (excluding atom_j)
+        # Find a HEAVY-ATOM neighbor of atom_i (excluding atom_j and hydrogens)
         atom_a = None
         for neighbor in atom_i.GetNeighbors():
-            if neighbor.GetIdx() != atom_j_idx:
+            if neighbor.GetIdx() != atom_j_idx and neighbor.GetAtomicNum() != 1:
                 atom_a = neighbor.GetIdx()
                 break
 
-        # Find a neighbor of atom_j (excluding atom_i)
+        # Find a HEAVY-ATOM neighbor of atom_j (excluding atom_i and hydrogens)
         atom_b = None
         for neighbor in atom_j.GetNeighbors():
-            if neighbor.GetIdx() != atom_i_idx:
+            if neighbor.GetIdx() != atom_i_idx and neighbor.GetAtomicNum() != 1:
                 atom_b = neighbor.GetIdx()
                 break
 
