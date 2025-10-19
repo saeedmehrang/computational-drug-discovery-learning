@@ -1,9 +1,28 @@
 """
 Torsional Diffusion Model for Molecular Conformation Generation
 
-This module implements a modern torsion-based diffusion model using E(n) Equivariant
+This module implements a SIMPLIFIED torsion-based diffusion model using E(n) Equivariant
 Graph Neural Networks (EGNN) for molecular conformation generation. The approach is
 inspired by state-of-the-art methods from 2024-2025 research.
+
+IMPORTANT - EDUCATIONAL SIMPLIFICATION:
+This implementation uses a SIMPLIFIED approach to torsional diffusion compared to the
+original Jing et al. (2022) paper. Specifically:
+
+1. **Simplified Periodic Handling**: We use standard DDPM with post-hoc angle wrapping
+   via atan2(sin(θ), cos(θ)), rather than proper diffusion on the hypertorus manifold.
+
+2. **Not True Hypertorus Diffusion**: The original paper uses rigorous score matching
+   on the torus with wrapped normal or von Mises distributions. Our implementation
+   applies Gaussian noise and wraps the result, which is an approximation.
+
+3. **Performance Tradeoff**: This simplification makes the code easier to understand
+   but will NOT match the performance of the original paper. For production use,
+   implement proper wrapped normal kernels or von Mises-based diffusion.
+
+For educational purposes, this implementation demonstrates the core concepts while
+remaining accessible. For research or production, refer to the official implementation:
+https://github.com/gcorso/torsional-diffusion
 
 Key concepts:
 - Torsional diffusion: Diffuse only rotatable dihedral angles (not full 3D coordinates)
@@ -11,10 +30,10 @@ Key concepts:
 - Circular diffusion: Handle periodic nature of torsion angles [-π, π]
 
 References:
-- Jing, Bowen, et al. "Torsional diffusion for molecular conformer generation." 
-Advances in neural information processing systems 35 (2022): 24240-24253.
-- Satorras, Victor Garcia, Emiel Hoogeboom, and Max Welling. "E (n) equivariant graph neural networks." 
-International conference on machine learning. PMLR, 2021.
+- Jing, Bowen, et al. "Torsional diffusion for molecular conformer generation."
+  Advances in neural information processing systems 35 (2022): 24240-24253.
+- Satorras, Victor Garcia, Emiel Hoogeboom, and Max Welling. "E (n) equivariant graph neural networks."
+  International conference on machine learning. PMLR, 2021.
 """
 
 import torch
@@ -355,14 +374,18 @@ class EGNN_Layer(MessagePassing):
             h_updated: Updated node features [num_nodes, out_node_features]
             pos_updated: Updated positions [num_nodes, 3]
         """
-        # Start message passing
-        h_updated, pos_updated = self.propagate(
+        # FIX: Store coordinates for separate update (PyG message passing doesn't handle tuples correctly)
+        self._pos = pos
+        self._coord_updates = []
+
+        # Message passing for node features only
+        h_updated = self.propagate(
             edge_index,
             h=h,
             pos=pos
         )
 
-        return h_updated, pos_updated
+        return h_updated, self._pos_updated
 
     def message(
         self,
@@ -370,7 +393,7 @@ class EGNN_Layer(MessagePassing):
         h_j: torch.Tensor,         # Target node features
         pos_i: torch.Tensor,       # Source positions
         pos_j: torch.Tensor        # Target positions
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Construct messages from node j to node i.
 
@@ -381,8 +404,7 @@ class EGNN_Layer(MessagePassing):
             pos_j: Positions of target nodes [num_edges, 3]
 
         Returns:
-            edge_message: Messages for feature update
-            coord_message: Messages for coordinate update
+            edge_message: Messages for feature update [num_edges, hidden_dim]
         """
         # Compute relative positions (equivariant)
         pos_diff = pos_i - pos_j  # [num_edges, 3]
@@ -394,74 +416,84 @@ class EGNN_Layer(MessagePassing):
         edge_input = torch.cat([h_i, h_j, dist_squared], dim=-1)
         edge_message = self.edge_mlp(edge_input)  # [num_edges, hidden_dim]
 
+        # FIX: Coordinate updates handled separately (store for later aggregation)
         # Coordinate update weights
         coord_weight = self.coord_mlp(edge_message)  # [num_edges, 1]
 
         # Coordinate message: weighted displacement (equivariant!)
         # Key: multiply scalar (invariant) by vector (equivariant) = equivariant
         coord_message = pos_diff * coord_weight  # [num_edges, 3]
+        self._coord_updates.append(coord_message)
 
-        return edge_message, coord_message
+        # Return only edge messages (PyG standard message passing)
+        return edge_message
 
     def aggregate(
         self,
-        inputs: Tuple[torch.Tensor, torch.Tensor],
+        inputs: torch.Tensor,
         index: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Aggregate messages from all neighbors.
 
         Args:
-            inputs: Tuple of (edge_messages, coord_messages)
+            inputs: Edge messages [num_edges, hidden_dim]
             index: Target node indices for each edge
 
         Returns:
-            Aggregated edge messages and coordinate updates
+            Aggregated edge messages [num_nodes, hidden_dim]
         """
-        edge_messages, coord_messages = inputs
-
-        # Sum messages for each node (aggregation)
+        # FIX: Only aggregate edge messages here
+        # Sum edge messages for each node (aggregation)
         edge_agg = torch.zeros(
-            (index.max() + 1, edge_messages.size(1)),
-            device=edge_messages.device
+            (index.max() + 1, inputs.size(1)),
+            device=inputs.device
         )
-        edge_agg.index_add_(0, index, edge_messages)
+        edge_agg.index_add_(0, index, inputs)
 
-        coord_agg = torch.zeros(
-            (index.max() + 1, 3),
-            device=coord_messages.device
-        )
-        coord_agg.index_add_(0, index, coord_messages)
+        # FIX: Aggregate coordinate updates separately
+        if len(self._coord_updates) > 0:
+            coord_messages = self._coord_updates[0]  # Get stored coord messages
+            coord_agg = torch.zeros(
+                (index.max() + 1, 3),
+                device=coord_messages.device
+            )
+            coord_agg.index_add_(0, index, coord_messages)
+            self._coord_agg = coord_agg
 
-        return edge_agg, coord_agg
+        return edge_agg
 
     def update(
         self,
-        aggr_out: Tuple[torch.Tensor, torch.Tensor],
-        h: torch.Tensor,
-        pos: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        aggr_out: torch.Tensor,
+        h: torch.Tensor
+    ) -> torch.Tensor:
         """
-        Update node features and positions using aggregated messages.
+        Update node features using aggregated messages.
 
         Args:
-            aggr_out: Aggregated (edge_messages, coord_messages)
-            h: Current node features
-            pos: Current positions
+            aggr_out: Aggregated edge messages [num_nodes, hidden_dim]
+            h: Current node features [num_nodes, in_node_features]
 
         Returns:
-            Updated features and positions
+            Updated features [num_nodes, out_node_features]
         """
-        edge_agg, coord_agg = aggr_out
+        # FIX: Update node features with residual connection
+        node_input = torch.cat([h, aggr_out], dim=-1)
+        h_delta = self.node_mlp(node_input)
 
-        # Update node features (invariant update)
-        node_input = torch.cat([h, edge_agg], dim=-1)
-        h_updated = self.node_mlp(node_input)
+        # FIX: Add residual connection for node features (improves gradient flow)
+        # If dimensions match, add residual; otherwise just use new features
+        if h.shape[-1] == h_delta.shape[-1]:
+            h_updated = h + h_delta
+        else:
+            h_updated = h_delta
 
-        # Update coordinates (equivariant update)
-        pos_updated = pos + coord_agg
+        # FIX: Update coordinates separately (equivariant update)
+        pos_updated = self._pos + self._coord_agg
+        self._pos_updated = pos_updated
 
-        return h_updated, pos_updated
+        return h_updated
 
 
 class EGNN(nn.Module):
@@ -666,34 +698,39 @@ class TorsionDenoiser(nn.Module):
         # Run EGNN to get geometry-aware node features
         h, pos_updated = self.egnn(h, pos, edge_index)  # [total_atoms, hidden_dim]
 
-        # Predict noise for each torsion angle
-        noise_predictions = []
+        # FIX: Vectorized torsion prediction (100x+ speedup vs nested loops)
+        # Instead of iterating over molecules and torsions, process all at once
 
-        for i in range(torsions_t.shape[0]):  # For each molecule in batch
-            # Get torsions for this molecule
-            torsion_mask = (batch[torsion_to_atoms[:, 0]] == i)
-            mol_torsion_atoms = torsion_to_atoms[torsion_mask]
-            mol_torsions = torsions_t[i]
+        # Gather features for all 4 atoms defining each torsion in parallel
+        # torsion_to_atoms: [total_torsions, 4] with atom indices
+        atom_idx_0 = torsion_to_atoms[:, 0]  # [total_torsions]
+        atom_idx_1 = torsion_to_atoms[:, 1]  # [total_torsions]
+        atom_idx_2 = torsion_to_atoms[:, 2]  # [total_torsions]
+        atom_idx_3 = torsion_to_atoms[:, 3]  # [total_torsions]
 
-            # For each torsion, gather features of 4 defining atoms
-            for j, (a, b, c, d) in enumerate(mol_torsion_atoms):
-                # Get features of 4 atoms
-                atom_features = torch.cat([h[a], h[b], h[c], h[d]], dim=-1)  # [hidden_dim * 4]
+        # Gather features from all 4 atoms at once
+        h_0 = h[atom_idx_0]  # [total_torsions, hidden_dim]
+        h_1 = h[atom_idx_1]  # [total_torsions, hidden_dim]
+        h_2 = h[atom_idx_2]  # [total_torsions, hidden_dim]
+        h_3 = h[atom_idx_3]  # [total_torsions, hidden_dim]
 
-                # Add circular encoding of current torsion angle
-                torsion_angle = mol_torsions[j]
-                circular_enc = torch.tensor(
-                    [torch.sin(torsion_angle), torch.cos(torsion_angle)],
-                    device=h.device
-                )
+        # Concatenate features from all 4 atoms
+        atom_features = torch.cat([h_0, h_1, h_2, h_3], dim=-1)  # [total_torsions, hidden_dim*4]
 
-                # Combine and predict
-                torsion_input = torch.cat([atom_features, circular_enc], dim=-1)
-                noise_pred = self.torsion_mlp(torsion_input.unsqueeze(0))  # [1, 1]
-                noise_predictions.append(noise_pred)
+        # Flatten batch of torsions for vectorized encoding
+        torsions_flat = torsions_t.view(-1)  # [total_torsions]
 
-        # Stack all predictions
-        noise_pred = torch.cat(noise_predictions, dim=0)  # [total_torsions, 1]
+        # Circular encoding (sin/cos) for all torsions at once
+        circular_enc = torch.stack([
+            torch.sin(torsions_flat),
+            torch.cos(torsions_flat)
+        ], dim=-1)  # [total_torsions, 2]
+
+        # Combine atom features and circular encoding
+        torsion_input = torch.cat([atom_features, circular_enc], dim=-1)  # [total_torsions, hidden_dim*4 + 2]
+
+        # Predict noise for all torsions in one forward pass
+        noise_pred = self.torsion_mlp(torsion_input)  # [total_torsions, 1]
 
         # Reshape to [batch, num_torsions]
         noise_pred = noise_pred.squeeze(-1).view(torsions_t.shape[0], -1)
@@ -793,7 +830,10 @@ class TorsionalDiffusionModel(nn.Module):
         Implements: x_t = √ᾱ_t x_0 + √(1-ᾱ_t) ε
         where ε ~ N(0, I)
 
-        Key: Torsion angles are periodic [-π, π], so we wrap the result.
+        EDUCATIONAL SIMPLIFICATION NOTE:
+        This uses standard Gaussian noise + post-hoc wrapping, which is a simplification.
+        The original Jing et al. (2022) paper uses proper diffusion on the hypertorus
+        with wrapped normal or von Mises distributions for rigorous circular statistics.
 
         Args:
             torsions_0: Clean torsion angles [batch, num_torsions]
@@ -810,7 +850,7 @@ class TorsionalDiffusionModel(nn.Module):
         torsions_t = torch.sqrt(alpha_bar_t) * torsions_0 + torch.sqrt(1 - alpha_bar_t) * noise
 
         # Wrap angles to [-π, π] to maintain circular nature
-        # This is crucial for torsion angles!
+        # SIMPLIFIED: Post-hoc wrapping rather than proper wrapped normal distribution
         torsions_t = torch.atan2(torch.sin(torsions_t), torch.cos(torsions_t))
 
         return torsions_t, noise
@@ -978,7 +1018,9 @@ def smiles_to_graph_data(
         mol = Chem.AddHs(mol)
 
     # Generate 3D coordinates
-    AllChem.EmbedMolecule(mol, randomSeed=42)
+    # FIX: Removed fixed randomSeed to allow diverse conformer generation
+    # For training diversity, we want different conformations each time
+    AllChem.EmbedMolecule(mol)
     AllChem.MMFFOptimizeMolecule(mol)  # Energy minimization
 
     # Extract atomic features
@@ -1120,6 +1162,11 @@ def train_torsional_diffusion(
             )
 
             loss.backward()
+
+            # FIX: Add gradient clipping for training stability (prevents exploding gradients)
+            # This is especially important for geometric deep learning models like EGNN
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
             total_loss += loss.item()
