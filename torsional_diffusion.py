@@ -312,7 +312,7 @@ class EGNN_Layer(MessagePassing):
         out_node_features: int,
         residual: bool = True  # Add option for residual connection
     ):
-        # We aggregate feature messages and coordinate messages by summation ('add')
+        # We aggregate feature messages by summation ('add')
         super().__init__(aggr='add')
         self.residual = residual
 
@@ -348,15 +348,35 @@ class EGNN_Layer(MessagePassing):
         edge_index: torch.Tensor   # Edge indices [2, num_edges]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Propagates messages for feature and coordinate updates simultaneously.
+        Propagates messages for feature and coordinate updates.
         """
-        # propagate returns a tuple: (aggregated_feature_messages, aggregated_coord_updates)
-        agg_h, agg_pos_delta = self.propagate(
+        # Store edge features and coordinate updates during message passing
+        self.edge_features = None
+        self.pos_diff_cache = None
+
+        # propagate returns aggregated feature messages
+        agg_h = self.propagate(
             edge_index,
             h=h,
             pos=pos,
             size=(h.size(0), h.size(0))
         )
+
+        # Manually aggregate coordinate updates
+        edge_index_i = edge_index[0]  # Source nodes
+        edge_index_j = edge_index[1]  # Target nodes
+
+        pos_i = pos[edge_index_i]  # [num_edges, 3]
+        pos_j = pos[edge_index_j]  # [num_edges, 3]
+        pos_diff = pos_i - pos_j    # [num_edges, 3]
+
+        # Compute coordinate weights using edge features from message()
+        coord_weight = self.coord_mlp(self.edge_features)  # [num_edges, 1]
+        coord_messages = pos_diff * coord_weight  # [num_edges, 3]
+
+        # Aggregate coordinate messages by summing over incoming edges
+        agg_pos_delta = torch.zeros_like(pos)  # [num_nodes, 3]
+        agg_pos_delta.index_add_(0, edge_index_i, coord_messages)
 
         # 1. Update positions (Equivariant)
         pos_updated = pos + agg_pos_delta
@@ -372,9 +392,9 @@ class EGNN_Layer(MessagePassing):
         h_j: torch.Tensor,
         pos_i: torch.Tensor,
         pos_j: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
-        Constructs messages for features (invariant) and coordinates (equivariant).
+        Constructs messages for features (invariant).
         """
         # Compute relative positions (equivariant)
         pos_diff = pos_i - pos_j  # [num_edges, 3]
@@ -382,24 +402,16 @@ class EGNN_Layer(MessagePassing):
         # Compute squared distances (invariant)
         dist_squared = torch.sum(pos_diff ** 2, dim=-1, keepdim=True)  # [num_edges, 1]
 
-        # 1. Feature Message (Invariant)
+        # Feature Message (Invariant)
         edge_input = torch.cat([h_i, h_j, dist_squared], dim=-1)
         edge_message = self.edge_mlp(edge_input)  # [num_edges, hidden_dim]
 
-        # 2. Coordinate Message (Equivariant)
-        # Compute scalar weight (invariant)
-        coord_weight = self.coord_mlp(edge_message)  # [num_edges, 1]
+        # Store edge features for coordinate update computation
+        self.edge_features = edge_message
 
-        # Multiply scalar weight by displacement vector (Equivariant!)
-        coord_message = pos_diff * coord_weight  # [num_edges, 3]
+        # Return only feature messages for aggregation
+        return edge_message
 
-        # RETURN A TUPLE: PyG will aggregate both tensors separately
-        return edge_message, coord_message
-
-    # Note: When message returns a tuple, PyG automatically aggregates them
-    # separately based on the 'aggr' (summation in this case).
-    # We rename 'update' to 'update_h' for clarity and handle coordinates
-    # directly in the forward pass after aggregation.
     def update_h(
         self,
         h: torch.Tensor,           # Original features
@@ -1210,6 +1222,7 @@ def generate_conformer(
     # Prepare input
     batch = torch.zeros(data.x.shape[0], dtype=torch.long)
     num_torsions = len(data.torsion_angles)
+    torsion_batch_idx = torch.zeros(num_torsions, dtype=torch.long)
 
     # Generate torsions
     generated_torsions = model.generate_torsions(
@@ -1218,7 +1231,8 @@ def generate_conformer(
         edge_index=data.edge_index,
         torsion_to_atoms=data.torsion_to_atoms,
         batch=batch,
-        num_torsions=num_torsions
+        torsion_batch_idx=torsion_batch_idx,
+        total_torsions=num_torsions
     )
 
     return generated_torsions.squeeze().cpu(), data.torsion_angles.numpy()
