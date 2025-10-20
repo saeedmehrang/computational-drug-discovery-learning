@@ -301,8 +301,6 @@ class EGNN_Layer(MessagePassing):
 
     Maintains equivariance by separating invariant (features, distance)
     and equivariant (coordinates, displacement vectors) quantities.
-
-    Refactored to use standard PyG tuple message passing.
     """
 
     def __init__(
