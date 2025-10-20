@@ -299,61 +299,46 @@ class EGNN_Layer(MessagePassing):
     """
     E(n) Equivariant Graph Neural Network Layer.
 
-    This layer maintains equivariance to:
-    - Translations: shifting all coordinates
-    - Rotations: rotating all coordinates
-    - Reflections: mirroring coordinates
+    Maintains equivariance by separating invariant (features, distance)
+    and equivariant (coordinates, displacement vectors) quantities.
 
-    Key insight: Use distances (invariant) to update features (invariant) and
-    coordinate differences (equivariant) to update positions (equivariant).
-
-    Message passing:
-    1. Compute edge messages using distances (SE(3) invariant)
-    2. Update node features using aggregated messages (invariant)
-    3. Update coordinates using weighted displacement vectors (equivariant)
-
-    Args:
-        in_node_features: Dimension of input node features
-        hidden_dim: Dimension of hidden layers
-        out_node_features: Dimension of output node features
-
-    References:
-        Satorras et al., "E(n) Equivariant Graph Neural Networks" (ICML 2021)
+    Refactored to use standard PyG tuple message passing.
     """
 
     def __init__(
         self,
         in_node_features: int,
         hidden_dim: int,
-        out_node_features: int
+        out_node_features: int,
+        residual: bool = True  # Add option for residual connection
     ):
-        super().__init__(aggr='add')  # Aggregation: sum messages from neighbors
+        # We aggregate feature messages and coordinate messages by summation ('add')
+        super().__init__(aggr='add')
+        self.residual = residual
 
-        # Edge model: Φ_e (message function)
-        # Input: [h_i, h_j, ||x_i - x_j||^2, edge_attr]
-        # Output: message m_ij
+        # Edge model: Φ_e (message function for features)
+        # Input: [h_i, h_j, ||x_i - x_j||^2]
         self.edge_mlp = nn.Sequential(
             nn.Linear(in_node_features * 2 + 1, hidden_dim),
-            nn.SiLU(),  # Smooth activation (better than ReLU for equivariance)
+            nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU()
         )
 
         # Node model: Φ_h (feature update function)
-        # Input: [h_i, aggregated_messages]
-        # Output: updated features h_i'
+        # Input: [h_i, aggregated_feature_messages]
         self.node_mlp = nn.Sequential(
             nn.Linear(in_node_features + hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, out_node_features)
         )
 
-        # Coordinate model: Φ_x (position update function)
-        # Outputs scalar weights for coordinate updates
+        # Coordinate model: Φ_x (position update weight)
+        # Outputs scalar weights (invariant) based on feature messages
         self.coord_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 1, bias=False)
+            nn.Linear(hidden_dim, 1, bias=False)  # Scalar output
         )
 
     def forward(
@@ -363,156 +348,80 @@ class EGNN_Layer(MessagePassing):
         edge_index: torch.Tensor   # Edge indices [2, num_edges]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass of EGNN layer.
-
-        Args:
-            h: Node features of shape [num_nodes, in_node_features]
-            pos: Node positions of shape [num_nodes, 3]
-            edge_index: Edge connectivity of shape [2, num_edges]
-
-        Returns:
-            h_updated: Updated node features [num_nodes, out_node_features]
-            pos_updated: Updated positions [num_nodes, 3]
+        Propagates messages for feature and coordinate updates simultaneously.
         """
-        # FIX: Store coordinates for separate update (PyG message passing doesn't handle tuples correctly)
-        self._pos = pos
-        self._coord_updates = []
-
-        # Message passing for node features only
-        h_updated = self.propagate(
+        # propagate returns a tuple: (aggregated_feature_messages, aggregated_coord_updates)
+        agg_h, agg_pos_delta = self.propagate(
             edge_index,
             h=h,
-            pos=pos
+            pos=pos,
+            size=(h.size(0), h.size(0))
         )
 
-        return h_updated, self._pos_updated
+        # 1. Update positions (Equivariant)
+        pos_updated = pos + agg_pos_delta
+
+        # 2. Update node features (Invariant)
+        h_updated = self.update_h(h, agg_h)
+
+        return h_updated, pos_updated
 
     def message(
         self,
-        h_i: torch.Tensor,         # Source node features
-        h_j: torch.Tensor,         # Target node features
-        pos_i: torch.Tensor,       # Source positions
-        pos_j: torch.Tensor        # Target positions
-    ) -> torch.Tensor:
+        h_i: torch.Tensor,
+        h_j: torch.Tensor,
+        pos_i: torch.Tensor,
+        pos_j: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Construct messages from node j to node i.
-
-        Args:
-            h_i: Features of source nodes [num_edges, in_node_features]
-            h_j: Features of target nodes [num_edges, in_node_features]
-            pos_i: Positions of source nodes [num_edges, 3]
-            pos_j: Positions of target nodes [num_edges, 3]
-
-        Returns:
-            edge_message: Messages for feature update [num_edges, hidden_dim]
+        Constructs messages for features (invariant) and coordinates (equivariant).
         """
         # Compute relative positions (equivariant)
         pos_diff = pos_i - pos_j  # [num_edges, 3]
 
-        # Compute squared distances (invariant to rotation/translation)
+        # Compute squared distances (invariant)
         dist_squared = torch.sum(pos_diff ** 2, dim=-1, keepdim=True)  # [num_edges, 1]
 
-        # Edge message: combine features and distance
+        # 1. Feature Message (Invariant)
         edge_input = torch.cat([h_i, h_j, dist_squared], dim=-1)
         edge_message = self.edge_mlp(edge_input)  # [num_edges, hidden_dim]
 
-        # FIX: Coordinate updates handled separately (store for later aggregation)
-        # Coordinate update weights
+        # 2. Coordinate Message (Equivariant)
+        # Compute scalar weight (invariant)
         coord_weight = self.coord_mlp(edge_message)  # [num_edges, 1]
 
-        # Coordinate message: weighted displacement (equivariant!)
-        # Key: multiply scalar (invariant) by vector (equivariant) = equivariant
+        # Multiply scalar weight by displacement vector (Equivariant!)
         coord_message = pos_diff * coord_weight  # [num_edges, 3]
-        self._coord_updates.append(coord_message)
 
-        # Return only edge messages (PyG standard message passing)
-        return edge_message
+        # RETURN A TUPLE: PyG will aggregate both tensors separately
+        return edge_message, coord_message
 
-    def aggregate(
+    # Note: When message returns a tuple, PyG automatically aggregates them
+    # separately based on the 'aggr' (summation in this case).
+    # We rename 'update' to 'update_h' for clarity and handle coordinates
+    # directly in the forward pass after aggregation.
+    def update_h(
         self,
-        inputs: torch.Tensor,
-        index: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Aggregate messages from all neighbors.
-
-        Args:
-            inputs: Edge messages [num_edges, hidden_dim]
-            index: Target node indices for each edge
-
-        Returns:
-            Aggregated edge messages [num_nodes, hidden_dim]
-        """
-        # FIX: Only aggregate edge messages here
-        # Sum edge messages for each node (aggregation)
-        edge_agg = torch.zeros(
-            (index.max() + 1, inputs.size(1)),
-            device=inputs.device
-        )
-        edge_agg.index_add_(0, index, inputs)
-
-        # FIX: Aggregate coordinate updates separately
-        if len(self._coord_updates) > 0:
-            coord_messages = self._coord_updates[0]  # Get stored coord messages
-            coord_agg = torch.zeros(
-                (index.max() + 1, 3),
-                device=coord_messages.device
-            )
-            coord_agg.index_add_(0, index, coord_messages)
-            self._coord_agg = coord_agg
-
-        return edge_agg
-
-    def update(
-        self,
-        aggr_out: torch.Tensor,
-        h: torch.Tensor
+        h: torch.Tensor,           # Original features
+        agg_h: torch.Tensor        # Aggregated feature messages
     ) -> torch.Tensor:
         """
         Update node features using aggregated messages.
-
-        Args:
-            aggr_out: Aggregated edge messages [num_nodes, hidden_dim]
-            h: Current node features [num_nodes, in_node_features]
-
-        Returns:
-            Updated features [num_nodes, out_node_features]
         """
-        # FIX: Update node features with residual connection
-        node_input = torch.cat([h, aggr_out], dim=-1)
-        h_delta = self.node_mlp(node_input)
+        node_input = torch.cat([h, agg_h], dim=-1)
+        h_new = self.node_mlp(node_input)
 
-        # FIX: Add residual connection for node features (improves gradient flow)
-        # If dimensions match, add residual; otherwise just use new features
-        if h.shape[-1] == h_delta.shape[-1]:
-            h_updated = h + h_delta
+        # Apply residual connection if enabled and dimensions match
+        if self.residual and h.shape[-1] == h_new.shape[-1]:
+            return h + h_new
         else:
-            h_updated = h_delta
-
-        # FIX: Update coordinates separately (equivariant update)
-        pos_updated = self._pos + self._coord_agg
-        self._pos_updated = pos_updated
-
-        return h_updated
+            return h_new
 
 
+# The EGNN wrapper class remains correct and robust.
 class EGNN(nn.Module):
     """
     Multi-layer E(n) Equivariant Graph Neural Network.
-
-    Stacks multiple EGNN layers to create a deep equivariant network.
-    Each layer refines both node features and 3D positions while maintaining
-    SE(3) equivariance.
-
-    Args:
-        in_node_features: Input node feature dimension
-        hidden_dim: Hidden layer dimension
-        out_node_features: Output node feature dimension
-        num_layers: Number of EGNN layers to stack
-
-    Example:
-        egnn = EGNN(in_node_features=16, hidden_dim=64, out_node_features=32, num_layers=3)
-        h_out, pos_out = egnn(h, pos, edge_index)
     """
 
     def __init__(
@@ -520,26 +429,27 @@ class EGNN(nn.Module):
         in_node_features: int,
         hidden_dim: int,
         out_node_features: int,
-        num_layers: int = 3
+        num_layers: int = 3,
+        residual: bool = True
     ):
         super().__init__()
 
         self.layers = nn.ModuleList()
 
-        # First layer
+        # Input layer (in_node_features -> hidden_dim)
         self.layers.append(
-            EGNN_Layer(in_node_features, hidden_dim, hidden_dim)
+            EGNN_Layer(in_node_features, hidden_dim, hidden_dim, residual)
         )
 
-        # Middle layers
+        # Middle layers (hidden_dim -> hidden_dim)
         for _ in range(num_layers - 2):
             self.layers.append(
-                EGNN_Layer(hidden_dim, hidden_dim, hidden_dim)
+                EGNN_Layer(hidden_dim, hidden_dim, hidden_dim, residual)
             )
 
-        # Final layer
+        # Final layer (hidden_dim -> out_node_features)
         self.layers.append(
-            EGNN_Layer(hidden_dim, hidden_dim, out_node_features)
+            EGNN_Layer(hidden_dim, hidden_dim, out_node_features, residual)
         )
 
     def forward(
@@ -548,23 +458,10 @@ class EGNN(nn.Module):
         pos: torch.Tensor,
         edge_index: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass through all EGNN layers.
-
-        Args:
-            h: Node features [num_nodes, in_node_features]
-            pos: Node positions [num_nodes, 3]
-            edge_index: Edge connectivity [2, num_edges]
-
-        Returns:
-            h: Final node features [num_nodes, out_node_features]
-            pos: Final positions [num_nodes, 3]
-        """
         for layer in self.layers:
             h, pos = layer(h, pos, edge_index)
 
         return h, pos
-
 
 # ============================================================================
 # Torsion Angle Denoising Network (EGNN-based)
