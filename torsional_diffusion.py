@@ -470,42 +470,46 @@ class EGNN(nn.Module):
 class TorsionDenoiser(nn.Module):
     """
     Neural network for predicting noise in torsion angles using EGNN.
-
-    This is the core denoising network ε_θ(x_t, t) that predicts the noise
-    added to torsion angles at timestep t.
-
-    Architecture:
-    1. Time embedding: Sinusoidal positional encoding of timestep
-    2. Torsion encoding: Circular encoding (sin, cos) of angles
-    3. EGNN backbone: Process molecular graph with 3D geometry
-    4. Torsion prediction: Per-torsion noise prediction
-
-    Args:
-        hidden_dim: Dimension of hidden layers
-        num_egnn_layers: Number of EGNN layers
-
-    Input:
-        torsions_t: Noisy torsion angles at time t [batch, num_torsions]
-        t: Timestep [batch]
-        node_features: Atomic features [total_atoms, atom_feature_dim]
-        pos: 3D coordinates [total_atoms, 3]
-        edge_index: Molecular graph edges [2, num_edges]
-        torsion_to_atoms: Mapping from torsions to atoms [num_torsions, 4]
-        batch: Batch assignment [total_atoms]
-
-    Output:
-        noise_pred: Predicted noise in torsions [batch, num_torsions]
+    
+    Revised for vectorized time-embedding and simplified torsion input handling.
     """
 
     def __init__(
         self,
+        atom_feature_dim: int,
         hidden_dim: int = 128,
         num_egnn_layers: int = 3
     ):
+        """
+        Initialize the torsion angle denoising network.
+        
+        Architecture components:
+            - Time MLP: Processes sinusoidal timestep embeddings
+            - Node embedding: Projects atom features to hidden dimension
+            - EGNN backbone: E(n)-equivariant message passing for geometry processing
+            - Torsion MLP: Predicts per-torsion noise from local atomic context
+        
+        Args:
+            atom_feature_dim: Dimension of input atomic features
+                Common values: 64-128 (depends on featurization scheme)
+            hidden_dim: Hidden layer dimension for all networks
+                Larger values increase capacity but slow training
+                Recommended: 128-256
+            num_egnn_layers: Number of EGNN layers to stack
+                More layers = larger receptive field but slower
+                Recommended: 3-5 for molecules with <100 atoms
+        
+        Example:
+            >>> model = TorsionDenoiser(
+            ...     atom_feature_dim=74,  # e.g., one-hot element + 6 extra features
+            ...     hidden_dim=128,
+            ...     num_egnn_layers=4
+            ... )
+        """
         super().__init__()
         self.hidden_dim = hidden_dim
 
-        # Time embedding network (Transformer-style sinusoidal embeddings)
+        # Time embedding network
         self.time_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
@@ -513,11 +517,10 @@ class TorsionDenoiser(nn.Module):
         )
 
         # Initial node feature embedding
-        # Input: [atomic_num (1-hot encoded) + time_embed + torsion_embed]
-        # For simplicity, we use a fixed embedding dimension
-        self.node_embedding = nn.Linear(128, hidden_dim)  # 128: max atomic features
+        # Correctly uses the input feature dimension
+        self.node_embedding = nn.Linear(atom_feature_dim, hidden_dim)
 
-        # EGNN backbone for geometric message passing
+        # EGNN backbone
         self.egnn = EGNN(
             in_node_features=hidden_dim,
             hidden_dim=hidden_dim,
@@ -526,7 +529,6 @@ class TorsionDenoiser(nn.Module):
         )
 
         # Torsion-level prediction head
-        # Input: features of 4 atoms defining the torsion + circular encoding
         self.torsion_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 4 + 2, hidden_dim),  # 4 atoms + sin/cos
             nn.SiLU(),
@@ -537,103 +539,130 @@ class TorsionDenoiser(nn.Module):
 
     def get_time_embedding(self, timesteps: torch.Tensor) -> torch.Tensor:
         """
-        Create sinusoidal time embeddings.
-
-        Uses the same approach as Transformer positional encodings:
-        PE(t, 2i) = sin(t / 10000^(2i/d))
-        PE(t, 2i+1) = cos(t / 10000^(2i/d))
-
+        Create sinusoidal time embeddings for diffusion timesteps.
+        
+        Uses Transformer-style positional encodings to embed continuous timestep values:
+            PE(t, 2i) = sin(t / 10000^(2i/d))
+            PE(t, 2i+1) = cos(t / 10000^(2i/d))
+        
+        This encoding allows the network to learn temporal patterns in the denoising
+        process and distinguish between early (high noise) and late (low noise) timesteps.
+        
         Args:
-            timesteps: Timestep values [batch]
-
+            timesteps: Diffusion timestep values [batch_size]
+                Typically in range [0, num_diffusion_steps]
+        
         Returns:
-            Time embeddings [batch, hidden_dim]
+            Time embeddings [batch_size, hidden_dim]
+                High-dimensional representation of timesteps for conditioning the network
+        
+        Note:
+            Handles odd hidden_dim by padding with zeros to avoid dimension mismatch.
         """
         half_dim = self.hidden_dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
         emb = timesteps.float()[:, None] * emb[None, :]
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+        
+        # Handle case where hidden_dim is odd
+        if self.hidden_dim % 2 != 0:
+            pad = torch.zeros(timesteps.shape[0], 1, device=timesteps.device)
+            emb = torch.cat([torch.sin(emb), torch.cos(emb), pad], dim=-1)
+        else:
+             emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+
         return self.time_mlp(emb)
+
 
     def forward(
         self,
-        torsions_t: torch.Tensor,          # [batch, num_torsions]
-        t: torch.Tensor,                   # [batch]
-        node_features: torch.Tensor,       # [total_atoms, feature_dim]
-        pos: torch.Tensor,                 # [total_atoms, 3]
-        edge_index: torch.Tensor,          # [2, num_edges]
-        torsion_to_atoms: torch.Tensor,    # [total_torsions, 4]
-        batch: torch.Tensor                # [total_atoms]
+        torsions_t: torch.Tensor,        # [total_torsions_in_batch]
+        t: torch.Tensor,                 # [batch_size]
+        node_features: torch.Tensor,     # [total_atoms, feature_dim]
+        pos: torch.Tensor,               # [total_atoms, 3]
+        edge_index: torch.Tensor,        # [2, num_edges]
+        torsion_to_atoms: torch.Tensor,  # [total_torsions_in_batch, 4]
+        batch: torch.Tensor,             # [total_atoms]
+        torsion_batch_idx: torch.Tensor, # [total_torsions_in_batch]
     ) -> torch.Tensor:
         """
-        Predict noise in torsion angles using EGNN.
-
+        Predict noise in torsion angles using geometry-aware message passing.
+        
+        Pipeline:
+            1. Embed timestep t into high-dimensional representation
+            2. Initialize node features and broadcast time embeddings to all atoms
+            3. Run EGNN to refine features using 3D molecular geometry
+            4. Extract features of 4 atoms defining each torsion angle
+            5. Combine with circular encoding (sin/cos) of current torsion values
+            6. Predict noise for each torsion independently
+        
         Args:
-            torsions_t: Noisy torsion angles [batch_size, num_torsions]
-            t: Timesteps [batch_size]
+            torsions_t: Noisy torsion angles at timestep t [total_torsions_in_batch]
+                Flattened across all molecules in batch (in radians)
+            t: Diffusion timesteps [batch_size]
+                One timestep value per molecule
             node_features: Atomic features [total_atoms, feature_dim]
-            pos: 3D coordinates [total_atoms, 3]
-            edge_index: Graph edges [2, num_edges]
-            torsion_to_atoms: Atom indices for each torsion [total_torsions, 4]
-            batch: Batch assignment [total_atoms]
-
+                Features like atom type, charge, hybridization, etc.
+            pos: 3D atomic coordinates [total_atoms, 3]
+                Current positions (Angstroms)
+            edge_index: Molecular graph connectivity [2, num_edges]
+                Edge list in PyG format: [source_nodes; target_nodes]
+            torsion_to_atoms: Atom indices defining torsions [total_torsions_in_batch, 4]
+                Each row contains [atom_i, atom_j, atom_k, atom_l] for torsion i-j-k-l
+            batch: Batch assignment for atoms [total_atoms]
+                Maps each atom to its molecule index
+            torsion_batch_idx: Batch assignment for torsions [total_torsions_in_batch]
+                Maps each torsion to its molecule index
+        
         Returns:
-            Predicted noise [batch_size, num_torsions]
+            noise_pred: Predicted noise for each torsion [total_torsions_in_batch]
+                Values to subtract from torsions_t to denoise (in radians)
+        
+        Note:
+            Uses flat batching to naturally handle molecules with different numbers
+            of torsions. The caller is responsible for gathering predictions by
+            molecule using torsion_batch_idx if needed.
         """
-        # Get time embedding
+        # 1. Time embedding and feature initialization
         time_embed = self.get_time_embedding(t)  # [batch, hidden_dim]
+        h = self.node_embedding(node_features)   # [total_atoms, hidden_dim]
 
-        # Embed node features
-        h = self.node_embedding(node_features)  # [total_atoms, hidden_dim]
+        # 2. Vectorized Time Embedding Broadcast (Fix for Issue B)
+        # time_embed[batch] gathers the correct time embedding for each atom
+        time_embed_per_node = time_embed[batch]
+        h = h + time_embed_per_node              # [total_atoms, hidden_dim]
 
-        # Add time embedding to each node (broadcast per batch)
-        for i in range(t.shape[0]):
-            mask = (batch == i)
-            h[mask] = h[mask] + time_embed[i:i+1]
+        # 3. Run EGNN
+        h, pos_updated = self.egnn(h, pos, edge_index) # [total_atoms, hidden_dim]
 
-        # Run EGNN to get geometry-aware node features
-        h, pos_updated = self.egnn(h, pos, edge_index)  # [total_atoms, hidden_dim]
+        # 4. Vectorized Torsion Prediction
+        
+        # Gather features for all 4 atoms defining each torsion
+        h_0 = h[torsion_to_atoms[:, 0]]
+        h_1 = h[torsion_to_atoms[:, 1]]
+        h_2 = h[torsion_to_atoms[:, 2]]
+        h_3 = h[torsion_to_atoms[:, 3]]
+        atom_features = torch.cat([h_0, h_1, h_2, h_3], dim=-1) # [total_torsions, hidden_dim*4]
 
-        # FIX: Vectorized torsion prediction (100x+ speedup vs nested loops)
-        # Instead of iterating over molecules and torsions, process all at once
-
-        # Gather features for all 4 atoms defining each torsion in parallel
-        # torsion_to_atoms: [total_torsions, 4] with atom indices
-        atom_idx_0 = torsion_to_atoms[:, 0]  # [total_torsions]
-        atom_idx_1 = torsion_to_atoms[:, 1]  # [total_torsions]
-        atom_idx_2 = torsion_to_atoms[:, 2]  # [total_torsions]
-        atom_idx_3 = torsion_to_atoms[:, 3]  # [total_torsions]
-
-        # Gather features from all 4 atoms at once
-        h_0 = h[atom_idx_0]  # [total_torsions, hidden_dim]
-        h_1 = h[atom_idx_1]  # [total_torsions, hidden_dim]
-        h_2 = h[atom_idx_2]  # [total_torsions, hidden_dim]
-        h_3 = h[atom_idx_3]  # [total_torsions, hidden_dim]
-
-        # Concatenate features from all 4 atoms
-        atom_features = torch.cat([h_0, h_1, h_2, h_3], dim=-1)  # [total_torsions, hidden_dim*4]
-
-        # Flatten batch of torsions for vectorized encoding
-        torsions_flat = torsions_t.view(-1)  # [total_torsions]
-
-        # Circular encoding (sin/cos) for all torsions at once
+        # Circular encoding for all torsions
         circular_enc = torch.stack([
-            torch.sin(torsions_flat),
-            torch.cos(torsions_flat)
-        ], dim=-1)  # [total_torsions, 2]
+            torch.sin(torsions_t),
+            torch.cos(torsions_t)
+        ], dim=-1) # [total_torsions, 2]
 
-        # Combine atom features and circular encoding
-        torsion_input = torch.cat([atom_features, circular_enc], dim=-1)  # [total_torsions, hidden_dim*4 + 2]
+        # Combine and predict
+        torsion_input = torch.cat([atom_features, circular_enc], dim=-1)
+        noise_pred_flat = self.torsion_mlp(torsion_input).squeeze(-1) # [total_torsions]
 
-        # Predict noise for all torsions in one forward pass
-        noise_pred = self.torsion_mlp(torsion_input)  # [total_torsions, 1]
-
-        # Reshape to [batch, num_torsions]
-        noise_pred = noise_pred.squeeze(-1).view(torsions_t.shape[0], -1)
-
-        return noise_pred
-
+        # 5. Reshape Output (Fix for Issue A)
+        # If the output needs to be [batch, max_torsions], the caller must handle 
+        # padding, which is complex and often unnecessary for loss calculation.
+        # It's safest to return the flat prediction and rely on the loss function
+        # to use the `torsion_batch_idx` if needed.
+        
+        # We return the flat tensor [total_torsions_in_batch]
+        return noise_pred_flat
+    
 
 # ============================================================================
 # Torsional Diffusion Model
@@ -642,34 +671,35 @@ class TorsionDenoiser(nn.Module):
 class TorsionalDiffusionModel(nn.Module):
     """
     Complete torsional diffusion model for molecular conformation generation.
-
+    
     This implements the DDPM (Denoising Diffusion Probabilistic Model) framework
     specifically for molecular torsion angles.
-
+    
     Key components:
     1. Noise schedule: Cosine schedule for β_t (better than linear)
     2. Forward process: q(x_t | x_0) = N(√ᾱ_t x_0, (1-ᾱ_t)I)
     3. Reverse process: p_θ(x_{t-1} | x_t) using EGNN denoiser
     4. Circular wrapping: Handle periodic nature of angles
-
+    
     Args:
+        atom_feature_dim: Dimension of input atomic features
         hidden_dim: Hidden dimension for neural networks
         num_timesteps: Number of diffusion steps (typically 1000)
         num_egnn_layers: Number of EGNN layers in denoiser
-
+    
     Training:
         loss = MSE(ε, ε_θ(√ᾱ_t x_0 + √(1-ᾱ_t) ε, t))
         where ε ~ N(0, I) is the added noise
-
+    
     Sampling:
         Start from x_T ~ N(0, I)
         For t = T to 1:
             x_{t-1} = (1/√α_t)(x_t - (1-α_t)/√(1-ᾱ_t) ε_θ(x_t, t)) + σ_t z
         Return x_0
     """
-
     def __init__(
         self,
+        atom_feature_dim: int,
         hidden_dim: int = 128,
         num_timesteps: int = 1000,
         num_egnn_layers: int = 3
@@ -677,35 +707,36 @@ class TorsionalDiffusionModel(nn.Module):
         super().__init__()
         self.num_timesteps = num_timesteps
         self.hidden_dim = hidden_dim
-
+        
         # Noise schedule parameters
-        # β_t: variance of noise added at step t
-        # α_t = 1 - β_t
-        # ᾱ_t = ∏_{i=1}^t α_i (cumulative product)
         self.register_buffer('betas', self.cosine_schedule(num_timesteps))
         self.register_buffer('alphas', 1 - self.betas)
         self.register_buffer('alpha_bars', torch.cumprod(self.alphas, dim=0))
-
+        
         # Denoising network ε_θ
-        self.denoiser = TorsionDenoiser(hidden_dim, num_egnn_layers)
-
+        self.denoiser = TorsionDenoiser(
+            atom_feature_dim=atom_feature_dim,
+            hidden_dim=hidden_dim,
+            num_egnn_layers=num_egnn_layers
+        )
+    
     def cosine_schedule(self, timesteps: int, s: float = 0.008) -> torch.Tensor:
         """
         Cosine noise schedule for diffusion.
-
+        
         Better than linear schedule - provides:
         - Slower noise addition at start (preserve structure)
         - Faster noise at end (reach noise quickly)
-
+        
         Formula: ᾱ_t = cos²((t/T + s)/(1 + s) · π/2)
-
+        
         Args:
             timesteps: Total number of diffusion steps
             s: Small offset for numerical stability
-
+        
         Returns:
             betas: Noise schedule [num_timesteps]
-
+        
         Reference:
             Nichol & Dhariwal, "Improved Denoising Diffusion Probabilistic Models"
         """
@@ -715,163 +746,232 @@ class TorsionalDiffusionModel(nn.Module):
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
         return torch.clip(betas, 0.0001, 0.9999)
-
+    
     def add_noise_to_torsions(
         self,
-        torsions_0: torch.Tensor,
-        t: torch.Tensor
+        torsions_0: torch.Tensor,  # [total_torsions]
+        t: torch.Tensor            # [total_torsions]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward diffusion: add noise to clean torsion angles.
-
+        
         Implements: x_t = √ᾱ_t x_0 + √(1-ᾱ_t) ε
         where ε ~ N(0, I)
-
+        
         EDUCATIONAL SIMPLIFICATION NOTE:
         This uses standard Gaussian noise + post-hoc wrapping, which is a simplification.
         The original Jing et al. (2022) paper uses proper diffusion on the hypertorus
         with wrapped normal or von Mises distributions for rigorous circular statistics.
-
+        
         Args:
-            torsions_0: Clean torsion angles [batch, num_torsions]
-            t: Timestep for each sample [batch]
-
+            torsions_0: Clean torsion angles [total_torsions] (radians)
+            t: Timestep for each torsion [total_torsions]
+        
         Returns:
-            torsions_t: Noisy torsion angles [batch, num_torsions]
-            noise: The noise that was added [batch, num_torsions]
+            torsions_t: Noisy torsion angles [total_torsions]
+            noise: The noise that was added [total_torsions]
         """
+        # Sample random noise
         noise = torch.randn_like(torsions_0)
-        alpha_bar_t = self.alpha_bars[t].view(-1, 1)
-
+        
+        # FIX 1: Proper broadcasting with explicit reshape
+        # Get alpha_bar values for each timestep
+        alpha_bar_t = self.alpha_bars[t]  # [total_torsions]
+        
+        # Compute coefficients
+        sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
+        sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
+        
         # Standard DDPM forward process
-        torsions_t = torch.sqrt(alpha_bar_t) * torsions_0 + torch.sqrt(1 - alpha_bar_t) * noise
-
-        # Wrap angles to [-π, π] to maintain circular nature
-        # SIMPLIFIED: Post-hoc wrapping rather than proper wrapped normal distribution
+        torsions_t = sqrt_alpha_bar_t * torsions_0 + sqrt_one_minus_alpha_bar_t * noise
+        
+        # Wrap angles to [-π, π]
         torsions_t = torch.atan2(torch.sin(torsions_t), torch.cos(torsions_t))
-
+        
         return torsions_t, noise
-
+    
     def training_step(
         self,
-        clean_torsions: torch.Tensor,
-        node_features: torch.Tensor,
-        pos: torch.Tensor,
-        edge_index: torch.Tensor,
-        torsion_to_atoms: torch.Tensor,
-        batch: torch.Tensor
+        clean_torsions_flat: torch.Tensor,  # [total_torsions]
+        node_features: torch.Tensor,         # [total_atoms, feature_dim]
+        pos: torch.Tensor,                   # [total_atoms, 3]
+        edge_index: torch.Tensor,            # [2, num_edges]
+        torsion_to_atoms: torch.Tensor,      # [total_torsions, 4]
+        batch: torch.Tensor,                 # [total_atoms]
+        torsion_batch_idx: torch.Tensor      # [total_torsions]
     ) -> torch.Tensor:
         """
-        Single training step for the diffusion model.
-
-        Algorithm:
-        1. Sample random timesteps t ~ Uniform(0, T)
-        2. Sample noise ε ~ N(0, I)
-        3. Create noisy samples x_t = √ᾱ_t x_0 + √(1-ᾱ_t) ε
-        4. Predict noise: ε_θ(x_t, t)
-        5. Compute loss: MSE(ε, ε_θ)
-
+        Single training step for torsional diffusion.
+        
+        DDPM Training Objective:
+            L_simple = E_{x_0, ε, t} [||ε - ε_θ(√ᾱ_t x_0 + √(1-ᾱ_t) ε, t)||²]
+        
+        Where:
+            - x_0: clean torsion angles
+            - ε ~ N(0, I): random noise
+            - t ~ Uniform(0, T): random timestep
+            - ε_θ: neural network (EGNN denoiser)
+        
+        Batching Strategy:
+            Uses PyTorch Geometric's flat batching:
+            - All torsions from all molecules concatenated: [total_torsions]
+            - All atoms from all molecules concatenated: [total_atoms]
+            - Mappings track which molecule each torsion/atom belongs to
+        
         Args:
-            clean_torsions: Ground truth torsions [batch, num_torsions]
-            node_features: Atomic features [total_atoms, feature_dim]
+            clean_torsions_flat: Ground truth angles [total_torsions] (radians, in [-π, π])
+            node_features: Atom features [total_atoms, feature_dim]
             pos: 3D coordinates [total_atoms, 3]
-            edge_index: Graph connectivity [2, num_edges]
-            torsion_to_atoms: Torsion definitions [total_torsions, 4]
-            batch: Batch assignment [total_atoms]
-
+            edge_index: Molecular bonds [2, num_edges]
+            torsion_to_atoms: Defines each torsion [total_torsions, 4]
+            batch: Maps atoms to molecules [total_atoms]
+            torsion_batch_idx: Maps torsions to molecules [total_torsions]
+        
         Returns:
-            loss: MSE between true and predicted noise
+            loss: MSE between true noise and predicted noise (scalar)
         """
-        batch_size = clean_torsions.shape[0]
-        device = clean_torsions.device
-
-        # Sample random timesteps
-        t = torch.randint(0, self.num_timesteps, (batch_size,), device=device)
-
-        # Add noise to torsions
-        noisy_torsions, true_noise = self.add_noise_to_torsions(clean_torsions, t)
-
+        # FIX 4: Add validation
+        mol_batch_size = batch.max().item() + 1
+        total_torsions = clean_torsions_flat.shape[0]
+        device = clean_torsions_flat.device
+        
+        assert torsion_batch_idx.max().item() + 1 == mol_batch_size, \
+            "Mismatch between atom batch and torsion batch sizes"
+        assert len(torsion_batch_idx) == total_torsions, \
+            "torsion_batch_idx length must match total_torsions"
+        
+        # Sample random timesteps per MOLECULE
+        t_mol = torch.randint(0, self.num_timesteps, (mol_batch_size,), device=device)
+        
+        # Broadcast timestep for each TORSION using torsion_batch_idx
+        # This maps t_mol[i] to every torsion belonging to molecule i
+        t = t_mol[torsion_batch_idx]  # [total_torsions]
+        
+        # Add noise to torsions (using flat tensors)
+        noisy_torsions, true_noise = self.add_noise_to_torsions(clean_torsions_flat, t)
+        
         # Predict noise using EGNN denoiser
         predicted_noise = self.denoiser(
-            noisy_torsions, t, node_features, pos, edge_index, torsion_to_atoms, batch
+            torsions_t=noisy_torsions,
+            t=t_mol,  # Pass molecular timesteps [batch_size]
+            node_features=node_features,
+            pos=pos,
+            edge_index=edge_index,
+            torsion_to_atoms=torsion_to_atoms,
+            batch=batch,
+            torsion_batch_idx=torsion_batch_idx
         )
-
-        # Compute loss (simple MSE on noise)
+        
+        # Compute loss (MSE on flat noise tensors)
         loss = F.mse_loss(predicted_noise, true_noise)
-
+        
         return loss
-
+    
     @torch.no_grad()
     def generate_torsions(
         self,
-        node_features: torch.Tensor,
-        pos: torch.Tensor,
-        edge_index: torch.Tensor,
-        torsion_to_atoms: torch.Tensor,
-        batch: torch.Tensor,
-        num_torsions: int
+        node_features: torch.Tensor,       # [num_atoms, feature_dim]
+        pos: torch.Tensor,                 # [num_atoms, 3]
+        edge_index: torch.Tensor,          # [2, num_edges]
+        torsion_to_atoms: torch.Tensor,    # [total_torsions, 4]
+        batch: torch.Tensor,               # [num_atoms]
+        torsion_batch_idx: torch.Tensor,   # [total_torsions]
+        total_torsions: int
     ) -> torch.Tensor:
         """
-        Generate new torsion angles via reverse diffusion.
-
-        Algorithm (DDPM sampling):
-        1. Start with random noise x_T ~ N(0, π²I)
-        2. For t = T-1 to 0:
-            - Predict noise: ε_θ(x_t, t)
-            - Compute mean: μ = (1/√α_t)(x_t - (1-α_t)/√(1-ᾱ_t) ε_θ)
-            - Sample: x_{t-1} = μ + σ_t z, z ~ N(0, I)
-            - Wrap to [-π, π]
-        3. Return x_0
-
+        Generates new torsion angles via the reverse diffusion process (sampling).
+        
+        The process starts from pure Gaussian noise (x_T) and iteratively denoises
+        the sample over 'num_timesteps' steps using the EGNN denoiser and the
+        pre-defined noise schedule.
+        
+        Algorithm (DDPM Sampling):
+        1. Start with random noise x_T ~ N(0, I) (scaled).
+        2. For t = T-1 down to 0:
+            a. Predict noise ε_θ(x_t, t) using the denoiser.
+            b. Calculate the mean μ_θ using the DDPM formula.
+            c. Sample x_{t-1} = μ_θ + σ_t z (adding noise except at t=0).
+            d. Wrap angles to [-π, π].
+        
         Args:
-            node_features: Atomic features [total_atoms, feature_dim]
-            pos: 3D coordinates [total_atoms, 3]
-            edge_index: Graph connectivity [2, num_edges]
-            torsion_to_atoms: Torsion definitions [total_torsions, 4]
-            batch: Batch assignment [total_atoms]
-            num_torsions: Number of torsions to generate
-
+            node_features: Atomic features for the single molecule being generated.
+                           Shape: [num_atoms, feature_dim]
+            pos: 3D coordinates. Shape: [num_atoms, 3]
+            edge_index: Graph connectivity. Shape: [2, num_edges]
+            torsion_to_atoms: Torsion definitions. Shape: [total_torsions, 4]
+            batch: Atom batch assignment (typically all zeros for a single molecule).
+                   Shape: [num_atoms]
+            torsion_batch_idx: Torsion batch assignment (typically all zeros).
+                               Shape: [total_torsions]
+            total_torsions: The exact number of torsions to be generated.
+        
         Returns:
-            Generated torsion angles [1, num_torsions]
+            Generated torsion angles (x_0). Shape: [total_torsions]
         """
+        # FIX 4: Add validation assertions
+        assert batch.max().item() == 0, \
+            "Generation only supports single molecule (batch_size=1). All batch indices must be 0."
+        assert torsion_batch_idx.max().item() == 0, \
+            "All torsions must belong to molecule 0 for generation."
+        assert len(torsion_batch_idx) == total_torsions, \
+            f"Mismatch in torsion count: torsion_batch_idx has {len(torsion_batch_idx)} elements, expected {total_torsions}"
+        
         device = next(self.parameters()).device
-
+        
+        # FIX 2: Remove unused line
         # Start from random noise (scaled by π for angle range)
-        torsions = torch.randn(1, num_torsions, device=device) * math.pi
-
+        torsions = torch.randn(total_torsions, device=device) * math.pi  # [total_torsions]
+        
         # Reverse diffusion process
         for t in reversed(range(self.num_timesteps)):
-            t_tensor = torch.tensor([t], device=device)
-
+            # Single timestep tensor for the molecule
+            t_tensor = torch.tensor([t], device=device)  # [1]
+            
             # Predict noise at this timestep
             predicted_noise = self.denoiser(
-                torsions, t_tensor, node_features, pos, edge_index, torsion_to_atoms, batch
+                torsions_t=torsions,
+                t=t_tensor,
+                node_features=node_features,
+                pos=pos,
+                edge_index=edge_index,
+                torsion_to_atoms=torsion_to_atoms,
+                batch=batch,
+                torsion_batch_idx=torsion_batch_idx
             )
-
+            
             # Get schedule parameters
             alpha_t = self.alphas[t]
             alpha_bar_t = self.alpha_bars[t]
-
-            # Compute denoised mean
-            # μ_θ(x_t, t) = (1/√α_t)(x_t - (1-α_t)/√(1-ᾱ_t) ε_θ(x_t, t))
+            beta_t = self.betas[t]
+            
+            # Compute denoised mean using DDPM formula
+            # μ_θ(x_t, t) = (1/√α_t) * (x_t - (β_t/√(1-ᾱ_t)) * ε_θ(x_t, t))
             torsions = (1 / torch.sqrt(alpha_t)) * (
-                torsions - ((1 - alpha_t) / torch.sqrt(1 - alpha_bar_t)) * predicted_noise
+                torsions - (beta_t / torch.sqrt(1 - alpha_bar_t)) * predicted_noise
             )
-
-            # Wrap to [-π, π] after denoising step
+            
+            # Wrap to [-π, π]
             torsions = torch.atan2(torch.sin(torsions), torch.cos(torsions))
-
+            
             # Add noise for all steps except the last
             if t > 0:
                 noise = torch.randn_like(torsions)
-                sigma_t = torch.sqrt(self.betas[t])
+                
+                # FIX 3: Use correct posterior variance
+                # Posterior variance: σ_t² = β_t * (1 - ᾱ_{t-1}) / (1 - ᾱ_t)
+                alpha_bar_t_prev = self.alpha_bars[t - 1]
+                
+                # Compute posterior variance (clipped for numerical stability)
+                posterior_variance = beta_t * (1 - alpha_bar_t_prev) / (1 - alpha_bar_t)
+                posterior_variance = torch.clamp(posterior_variance, min=1e-20)
+                
+                sigma_t = torch.sqrt(posterior_variance)
                 torsions = torsions + sigma_t * noise
-
+                
                 # Wrap again after adding noise
                 torsions = torch.atan2(torch.sin(torsions), torch.cos(torsions))
-
-        return torsions
-
+        
+        return torsions  # [total_torsions]
 
 # ============================================================================
 # Data Processing Functions
@@ -999,9 +1099,9 @@ def prepare_dataset(smiles_list: List[str]) -> List[Tuple[Data, Chem.Mol, str]]:
 # ============================================================================
 # Training and Evaluation
 # ============================================================================
-
 def train_torsional_diffusion(
     dataset: List[Tuple[Data, Chem.Mol, str]],
+    atom_feature_dim: int= 128,
     num_epochs: int = 100,
     lr: float = 1e-4,
     hidden_dim: int = 64,
@@ -1009,70 +1109,85 @@ def train_torsional_diffusion(
 ):
     """
     Train the torsional diffusion model on a dataset.
-
+    
     Args:
         dataset: List of (data, mol, smiles) tuples
         num_epochs: Number of training epochs
         lr: Learning rate
         hidden_dim: Hidden dimension for networks
         num_timesteps: Number of diffusion steps
-
+    
     Returns:
         Trained model
     """
     print("\n" + "=" * 70)
     print("TRAINING TORSIONAL DIFFUSION MODEL")
     print("=" * 70)
-
+    
     # Create model
     model = TorsionalDiffusionModel(
+        atom_feature_dim=atom_feature_dim,  # FIX: Was missing the value
         hidden_dim=hidden_dim,
         num_timesteps=num_timesteps,
         num_egnn_layers=3
     )
-
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
+    
     # Training loop
     for epoch in range(num_epochs):
         total_loss = 0.0
-
+        num_processed = 0  # Track actual number of molecules processed
+        
         for data, mol, smiles in dataset:
             # Skip molecules with no torsions
             if len(data.torsion_angles) == 0:
                 continue
-
+            
             optimizer.zero_grad()
-
-            # Prepare batch (single molecule)
+            
+            # FIX 2: Prepare batch indices correctly for flat batching
+            # Create atom batch indices (all zeros for single molecule)
             batch = torch.zeros(data.x.shape[0], dtype=torch.long)
-            torsions = data.torsion_angles.unsqueeze(0)  # [1, num_torsions]
-
-            # Training step
+            
+            # FIX 3: Create torsion batch indices (all zeros for single molecule)
+            num_torsions = len(data.torsion_angles)
+            torsion_batch_idx = torch.zeros(num_torsions, dtype=torch.long)
+            
+            # FIX 4: Use flat torsion tensor (remove unsqueeze)
+            # training_step expects [total_torsions], not [1, num_torsions]
+            clean_torsions_flat = data.torsion_angles  # [num_torsions]
+            
+            # Training step with corrected arguments
             loss = model.training_step(
-                clean_torsions=torsions,
+                clean_torsions_flat=clean_torsions_flat,  # FIX: Renamed parameter
                 node_features=data.x,
                 pos=data.pos,
                 edge_index=data.edge_index,
                 torsion_to_atoms=data.torsion_to_atoms,
-                batch=batch
+                batch=batch,
+                torsion_batch_idx=torsion_batch_idx  # FIX: Added missing parameter
             )
-
+            
             loss.backward()
-
-            # FIX: Add gradient clipping for training stability (prevents exploding gradients)
-            # This is especially important for geometric deep learning models like EGNN
+            
+            # Gradient clipping for training stability
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
+            
             optimizer.step()
-
+            
             total_loss += loss.item()
-
-        avg_loss = total_loss / len(dataset)
-
+            num_processed += 1
+        
+        # FIX 5: Use num_processed instead of len(dataset) for accurate average
+        # Some molecules might be skipped (no torsions)
+        if num_processed > 0:
+            avg_loss = total_loss / num_processed
+        else:
+            avg_loss = 0.0
+        
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
-
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Molecules: {num_processed}")
+    
     print("\n✓ Training completed!")
     return model
 
@@ -1165,6 +1280,7 @@ if __name__ == "__main__":
 
     model = train_torsional_diffusion(
         dataset=dataset,
+        atom_feature_dim=data.x.shape[-1],
         num_epochs=50,  # Reduced for demo
         lr=1e-4,
         hidden_dim=64,
