@@ -583,7 +583,6 @@ class TorsionDenoiser(nn.Module):
         edge_index: torch.Tensor,        # [2, num_edges]
         torsion_to_atoms: torch.Tensor,  # [total_torsions_in_batch, 4]
         batch: torch.Tensor,             # [total_atoms]
-        torsion_batch_idx: torch.Tensor, # [total_torsions_in_batch]
     ) -> torch.Tensor:
         """
         Predict noise in torsion angles using geometry-aware message passing.
@@ -611,8 +610,6 @@ class TorsionDenoiser(nn.Module):
                 Each row contains [atom_i, atom_j, atom_k, atom_l] for torsion i-j-k-l
             batch: Batch assignment for atoms [total_atoms]
                 Maps each atom to its molecule index
-            torsion_batch_idx: Batch assignment for torsions [total_torsions_in_batch]
-                Maps each torsion to its molecule index
         
         Returns:
             noise_pred: Predicted noise for each torsion [total_torsions_in_batch]
@@ -859,7 +856,6 @@ class TorsionalDiffusionModel(nn.Module):
             edge_index=edge_index,
             torsion_to_atoms=torsion_to_atoms,
             batch=batch,
-            torsion_batch_idx=torsion_batch_idx
         )
         
         # Compute loss (MSE on flat noise tensors)
@@ -936,7 +932,6 @@ class TorsionalDiffusionModel(nn.Module):
                 edge_index=edge_index,
                 torsion_to_atoms=torsion_to_atoms,
                 batch=batch,
-                torsion_batch_idx=torsion_batch_idx
             )
             
             # Get schedule parameters
